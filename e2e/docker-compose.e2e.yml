@@ -1,0 +1,32 @@
+# Overlay used by e2e/run.sh: swaps the real chat model for a deterministic mock LLM.
+# Not meant to be used on its own.
+services:
+  mock-llm:
+    image: python:3.12-slim
+    command: ["python", "/app/mock_llm.py"]
+    volumes:
+      - ./e2e/mock_llm.py:/app/mock_llm.py:ro
+    ports:
+      - "127.0.0.1:${MOCK_LLM_PORT:-19001}:8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  open-webui:
+    depends_on:
+      mock-llm:
+        condition: service_healthy
+    environment:
+      OPENAI_API_BASE_URL: http://mock-llm:8080/v1
+      OPENAI_API_KEY: mock-key
