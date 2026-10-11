@@ -1,0 +1,107 @@
+# Open WebUI + an OpenAPI image-generation tool server.
+#
+#   ./scripts/init-env.sh      # create .env with freshly generated secrets
+#   docker compose up -d --build --wait
+#
+# Open WebUI -> image-tool traffic stays on the private compose network and is
+# authenticated with a Bearer API key. Only 127.0.0.1 ports are published.
+
+name: owui-image-tool
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  image-tool:
+    <<: *hardening
+    build:
+      context: ./image-tool
+      target: runtime
+    environment:
+      # --- authorization -----------------------------------------------------
+      TOOL_API_KEY: ${TOOL_API_KEY:?TOOL_API_KEY is not set - run ./scripts/init-env.sh}
+      TOOL_API_KEY_PREVIOUS: ${TOOL_API_KEY_PREVIOUS:-}
+      URL_SIGNING_KEY: ${URL_SIGNING_KEY:-}
+      # --- behaviour ---------------------------------------------------------
+      # URL the *browser* uses to load generated images (published port below).
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:${TOOL_PORT:-8001}}
+      IMAGE_PROVIDER: ${IMAGE_PROVIDER:-auto}
+      # Not inherited from OPENAI_API_KEY on purpose (the chat endpoint may be another vendor).
+      IMAGE_API_KEY: ${IMAGE_API_KEY:-}
+      IMAGE_API_BASE_URL: ${IMAGE_API_BASE_URL:-https://api.openai.com/v1}
+      IMAGE_API_ALLOW_INSECURE: ${IMAGE_API_ALLOW_INSECURE:-false}
+      IMAGE_MODEL: ${IMAGE_MODEL:-gpt-image-2}
+      IMAGE_QUALITY: ${IMAGE_QUALITY:-}
+      IMAGE_TTL_SECONDS: ${IMAGE_TTL_SECONDS:-604800}
+      MAX_STORED_IMAGES: ${MAX_STORED_IMAGES:-1000}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-4}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-180}
+      ENABLE_DOCS: ${ENABLE_DOCS:-false}
+    ports:
+      - "127.0.0.1:${TOOL_PORT:-8001}:8000"
+    volumes:
+      - image-data:/data/images
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    # Health is defined once, in image-tool/Dockerfile (HEALTHCHECK).
+
+  open-webui:
+    <<: *hardening
+    # Pinned for reproducibility; the env-based tool registration below follows the
+    # v0.12 schema (config.access_grants). Override with OPEN_WEBUI_IMAGE in .env.
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.12.0}
+    depends_on:
+      image-tool:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WEBUI_PORT:-3000}:8080"
+    environment:
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY is not set - run ./scripts/init-env.sh}
+      # The first admin is created from these on the first start of an empty data volume.
+      # Public sign-up is off, so without an admin nobody could log in.
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:?WEBUI_ADMIN_EMAIL is not set - run ./scripts/init-env.sh}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD:-}
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:-False}
+      DEFAULT_USER_ROLE: pending
+      CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN:-http://localhost:${WEBUI_PORT:-3000};http://127.0.0.1:${WEBUI_PORT:-3000}}
+      # Declarative setup: the environment is the source of truth on every start.
+      # Set OWUI_PERSISTENT_CONFIG=True in .env to manage connections in the admin UI instead.
+      ENABLE_PERSISTENT_CONFIG: ${OWUI_PERSISTENT_CONFIG:-False}
+      # Chat model back-end: any OpenAI-compatible API.
+      ENABLE_OLLAMA_API: "False"
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # The tool server, registered as a global OpenAPI tool with Bearer auth.
+      # `info.id` becomes the tool id "server:image-tool".
+      TOOL_SERVER_CONNECTIONS: '[{"type":"openapi","url":"http://image-tool:8000","path":"openapi.json","spec_type":"url","auth_type":"bearer","key":"${TOOL_API_KEY}","config":{"enable":true,"access_grants":[{"principal_type":"user","principal_id":"*","permission":"read"}]},"info":{"id":"image-tool","name":"Image Generator","description":"Generate images from text prompts."}}]'
+      # Image generation can take up to ~2 minutes; keep this above REQUEST_TIMEOUT_SECONDS.
+      AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER: "240"
+      SCARF_NO_ANALYTICS: "true"
+      DO_NOT_TRACK: "true"
+      ANONYMIZED_TELEMETRY: "false"
+    # To use a model server running on the Docker host (e.g. Ollama on :11434), uncomment
+    # this and set OPENAI_API_BASE_URL=http://host.docker.internal:11434/v1 in .env.
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    volumes:
+      - open-webui-data:/app/backend/data
+    # The root filesystem stays writable (Open WebUI writes caches next to its code);
+    # capabilities are dropped and privilege escalation is disabled via the anchor.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+volumes:
+  image-data:
+  open-webui-data:
